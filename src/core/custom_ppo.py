@@ -315,7 +315,7 @@ class PPO(OnPolicyAlgorithm):
             outer_loss = policy_loss + self.ent_coef * \
                 entropy_loss + self.vf_coef * value_loss
 
-            return outer_loss
+            return value_loss, entropy_loss, policy_loss
 
     def train(self) -> None:
         """
@@ -454,8 +454,18 @@ class PPO(OnPolicyAlgorithm):
                 #     break
 
                 # update outer loss
+                value_loss, policy_loss, entropy_loss = self.outer_loss
+                print("="*10,"value_loss")
                 reverse_unroll(
-                    params_history[-1], self.shared_hypernet.parameters(), self.outer_loss, set_grad=True)
+                    params_history[-1], self.shared_hypernet.parameters(), value_loss, set_grad=True)
+                print("="*10,"value_loss")
+                reverse_unroll(
+                    params_history[-1], self.shared_hypernet.parameters(), value_loss, set_grad=True)
+                print("="*10,"value_loss")
+                reverse_unroll(
+                    params_history[-1], self.shared_hypernet.parameters(), value_loss, set_grad=True)
+                import sys
+                sys.exit()
                 meta_opt.step()
 
         self._n_updates += self.n_epochs
