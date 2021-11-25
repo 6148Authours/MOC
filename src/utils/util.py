@@ -35,6 +35,7 @@ def reverse_unroll(params: List[Tensor],
     grads = torch.autograd.grad(o_loss, hparams, retain_graph=True, create_graph=True, allow_unused=True)
     if set_grad:
         update_tensor_grads(hparams, grads)
+    print(grads)
     return grads
 
 
