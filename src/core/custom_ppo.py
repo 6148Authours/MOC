@@ -179,7 +179,7 @@ class PPO(OnPolicyAlgorithm):
     def return_replay_buffer(self):
         return self.rollout_buffer
 
-    def outer_loss(self, params, hparams):
+    def value_loss(self, params, hparams):
         # Outer update
         clip_range = self.clip_range(self._current_progress_remaining)
         if self.clip_range_vf is not None:
@@ -315,7 +315,283 @@ class PPO(OnPolicyAlgorithm):
             outer_loss = policy_loss + self.ent_coef * \
                 entropy_loss + self.vf_coef * value_loss
 
-            return value_loss, entropy_loss, policy_loss
+            return value_loss
+        
+    def entropy_loss(self, params, hparams):
+        # Outer update
+        clip_range = self.clip_range(self._current_progress_remaining)
+        if self.clip_range_vf is not None:
+            clip_range_vf = self.clip_range_vf(
+                self._current_progress_remaining)
+
+        for rollout_data in self.rollout_buffer.get(self.batch_size):
+            actions = rollout_data.actions
+            if isinstance(self.action_space, spaces.Discrete):
+                # Convert discrete action from float to long
+                actions = rollout_data.actions.long().flatten()
+
+            # Re-sample the noise matrix because the log_std has changed
+            # TODO: investigate why there is no issue with the gradient
+            # if that line is commented (as in SAC)
+            if self.use_sde:
+                self.policy.reset_noise(self.batch_size)
+
+            obs_tensor = th.as_tensor(
+                rollout_data.observations[:1].to(self.device))
+            rule_subgoal = th.tensor(
+                [[1, 0, 0]*self.env.num_envs]).view(self.env.num_envs, 3)
+            rule_init = th.tensor(
+                [[0, 1, 0]*self.env.num_envs]).view(self.env.num_envs, 3)
+            rule_reward = th.tensor(
+                [[0, 0, 1]*self.env.num_envs]).view(self.env.num_envs, 3)
+            obs_tensor_subgoal = th.cat(
+                (obs_tensor.float(), rule_subgoal.to(self.device)),
+                dim=1)
+            obs_tensor_init = th.cat(
+                (obs_tensor.float(), rule_init.to(self.device)),
+                dim=1)
+            obs_tensor_reward = th.cat(
+                (obs_tensor.float(), rule_reward.to(self.device)),
+                dim=1)
+            subgoals = []
+            rewards = []
+            init_states = []
+            memories = []
+            for i in range(64):
+                subgoal, state, hyper_state = self.shared_hypernet(x=obs_tensor_subgoal.float(),
+                                                                   state=self.state,
+                                                                   hyper_state=self.hyper_state,
+                                                                   lstm_cell=self.h_cell,
+                                                                   emit_mem=False)
+                shape_reward, state, hyper_state = self.shared_hypernet(x=obs_tensor_init.float(),
+                                                                        state=self.state,
+                                                                        hyper_state=self.hyper_state,
+                                                                        lstm_cell=self.reward_cell,
+                                                                        emit_mem=False)
+                init_state, state, hyper_state = self.shared_hypernet(x=obs_tensor_reward.float(),
+                                                                       state=self.state,
+                                                                       hyper_state=self.hyper_state,
+                                                                       lstm_cell=self.initial_cell,
+                                                                       emit_mem=False)
+                _, state, hyper_state, memory = self.shared_hypernet(x=obs_tensor_subgoal.float(),
+                                                                     state=self.state,
+                                                                     hyper_state=self.hyper_state,
+                                                                     lstm_cell=self.memory_cell,
+                                                                     emit_mem=True)
+
+                subgoals.append(subgoal)
+                rewards.append(shape_reward)
+                init_states.append(init_state)
+                memories.append(memory)
+
+            subgoals = th.cat(subgoals, dim=0)
+            rewards = th.cat(rewards, dim=0)
+            init_states = th.cat(init_states, dim=0)
+            memories = th.cat(memories, dim=0)
+
+            if self.goal_curriculum:
+                values, log_prob, entropy = self.policy.evaluate_actions_subgoal(rollout_data.observations,
+                                                                                 subgoals,
+                                                                                 actions)
+            elif self.memory_only:
+                values, log_prob, entropy = self.policy.evaluate_actions_memory(rollout_data.observations,
+                                                                                memories,
+                                                                                actions)
+            elif self.reward_shaping:
+                values, log_prob, entropy = self.policy.evaluate_actions_reward(rollout_data.observations,
+                                                                                rewards,
+                                                                                actions)
+            elif self.initial_curriculum:
+                values, log_prob, entropy = self.policy.evaluate_actions_init(rollout_data.observations,
+                                                                              init_states,
+                                                                              actions)
+            elif self.all_curricula:
+                values, log_prob, entropy = self.policy.evaluate_actions_all(rollout_data.observations,
+                                                                             subgoals,
+                                                                             rewards,
+                                                                             init_states,
+                                                                             memories,
+                                                                             actions)
+
+            else:
+                values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations,
+                                                                         actions)
+            values = values.flatten()
+            # Normalize advantage
+            advantages = rollout_data.advantages
+            advantages = (advantages - advantages.mean()) / \
+                (advantages.std() + 1e-8)
+
+            # ratio between old and new policy, should be one at the first iteration
+            ratio = th.exp(log_prob - rollout_data.old_log_prob)
+
+            # clipped surrogate loss
+            policy_loss_1 = advantages * ratio
+            policy_loss_2 = advantages * \
+                th.clamp(ratio, 1 - clip_range, 1 + clip_range)
+            policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
+
+            if self.clip_range_vf is None:
+                # No clipping
+                values_pred = values
+            else:
+                # Clip the different between old and new value
+                # NOTE: this depends on the reward scaling
+                values_pred = rollout_data.old_values + th.clamp(
+                    values - rollout_data.old_values, -clip_range_vf, clip_range_vf
+                )
+            # Value loss using the TD(gae_lambda) target
+            value_loss = F.mse_loss(rollout_data.returns, values_pred)
+
+            # Entropy loss favor exploration
+            if entropy is None:
+                # Approximate entropy when no analytical form
+                entropy_loss = -th.mean(-log_prob)
+            else:
+                entropy_loss = -th.mean(entropy)
+
+            outer_loss = policy_loss + self.ent_coef * \
+                entropy_loss + self.vf_coef * value_loss
+
+            return entropy_loss
+        
+    def policy_loss(self, params, hparams):
+        # Outer update
+        clip_range = self.clip_range(self._current_progress_remaining)
+        if self.clip_range_vf is not None:
+            clip_range_vf = self.clip_range_vf(
+                self._current_progress_remaining)
+
+        for rollout_data in self.rollout_buffer.get(self.batch_size):
+            actions = rollout_data.actions
+            if isinstance(self.action_space, spaces.Discrete):
+                # Convert discrete action from float to long
+                actions = rollout_data.actions.long().flatten()
+
+            # Re-sample the noise matrix because the log_std has changed
+            # TODO: investigate why there is no issue with the gradient
+            # if that line is commented (as in SAC)
+            if self.use_sde:
+                self.policy.reset_noise(self.batch_size)
+
+            obs_tensor = th.as_tensor(
+                rollout_data.observations[:1].to(self.device))
+            rule_subgoal = th.tensor(
+                [[1, 0, 0]*self.env.num_envs]).view(self.env.num_envs, 3)
+            rule_init = th.tensor(
+                [[0, 1, 0]*self.env.num_envs]).view(self.env.num_envs, 3)
+            rule_reward = th.tensor(
+                [[0, 0, 1]*self.env.num_envs]).view(self.env.num_envs, 3)
+            obs_tensor_subgoal = th.cat(
+                (obs_tensor.float(), rule_subgoal.to(self.device)),
+                dim=1)
+            obs_tensor_init = th.cat(
+                (obs_tensor.float(), rule_init.to(self.device)),
+                dim=1)
+            obs_tensor_reward = th.cat(
+                (obs_tensor.float(), rule_reward.to(self.device)),
+                dim=1)
+            subgoals = []
+            rewards = []
+            init_states = []
+            memories = []
+            for i in range(64):
+                subgoal, state, hyper_state = self.shared_hypernet(x=obs_tensor_subgoal.float(),
+                                                                   state=self.state,
+                                                                   hyper_state=self.hyper_state,
+                                                                   lstm_cell=self.h_cell,
+                                                                   emit_mem=False)
+                shape_reward, state, hyper_state = self.shared_hypernet(x=obs_tensor_init.float(),
+                                                                        state=self.state,
+                                                                        hyper_state=self.hyper_state,
+                                                                        lstm_cell=self.reward_cell,
+                                                                        emit_mem=False)
+                init_state, state, hyper_state = self.shared_hypernet(x=obs_tensor_reward.float(),
+                                                                       state=self.state,
+                                                                       hyper_state=self.hyper_state,
+                                                                       lstm_cell=self.initial_cell,
+                                                                       emit_mem=False)
+                _, state, hyper_state, memory = self.shared_hypernet(x=obs_tensor_subgoal.float(),
+                                                                     state=self.state,
+                                                                     hyper_state=self.hyper_state,
+                                                                     lstm_cell=self.memory_cell,
+                                                                     emit_mem=True)
+
+                subgoals.append(subgoal)
+                rewards.append(shape_reward)
+                init_states.append(init_state)
+                memories.append(memory)
+
+            subgoals = th.cat(subgoals, dim=0)
+            rewards = th.cat(rewards, dim=0)
+            init_states = th.cat(init_states, dim=0)
+            memories = th.cat(memories, dim=0)
+
+            if self.goal_curriculum:
+                values, log_prob, entropy = self.policy.evaluate_actions_subgoal(rollout_data.observations,
+                                                                                 subgoals,
+                                                                                 actions)
+            elif self.memory_only:
+                values, log_prob, entropy = self.policy.evaluate_actions_memory(rollout_data.observations,
+                                                                                memories,
+                                                                                actions)
+            elif self.reward_shaping:
+                values, log_prob, entropy = self.policy.evaluate_actions_reward(rollout_data.observations,
+                                                                                rewards,
+                                                                                actions)
+            elif self.initial_curriculum:
+                values, log_prob, entropy = self.policy.evaluate_actions_init(rollout_data.observations,
+                                                                              init_states,
+                                                                              actions)
+            elif self.all_curricula:
+                values, log_prob, entropy = self.policy.evaluate_actions_all(rollout_data.observations,
+                                                                             subgoals,
+                                                                             rewards,
+                                                                             init_states,
+                                                                             memories,
+                                                                             actions)
+
+            else:
+                values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations,
+                                                                         actions)
+            values = values.flatten()
+            # Normalize advantage
+            advantages = rollout_data.advantages
+            advantages = (advantages - advantages.mean()) / \
+                (advantages.std() + 1e-8)
+
+            # ratio between old and new policy, should be one at the first iteration
+            ratio = th.exp(log_prob - rollout_data.old_log_prob)
+
+            # clipped surrogate loss
+            policy_loss_1 = advantages * ratio
+            policy_loss_2 = advantages * \
+                th.clamp(ratio, 1 - clip_range, 1 + clip_range)
+            policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
+
+            if self.clip_range_vf is None:
+                # No clipping
+                values_pred = values
+            else:
+                # Clip the different between old and new value
+                # NOTE: this depends on the reward scaling
+                values_pred = rollout_data.old_values + th.clamp(
+                    values - rollout_data.old_values, -clip_range_vf, clip_range_vf
+                )
+            # Value loss using the TD(gae_lambda) target
+            value_loss = F.mse_loss(rollout_data.returns, values_pred)
+
+            # Entropy loss favor exploration
+            if entropy is None:
+                # Approximate entropy when no analytical form
+                entropy_loss = -th.mean(-log_prob)
+            else:
+                entropy_loss = -th.mean(entropy)
+
+            outer_loss = policy_loss + self.ent_coef * \
+                entropy_loss + self.vf_coef * value_loss
+
+            return policy_loss
 
     def train(self) -> None:
         """
@@ -454,16 +730,15 @@ class PPO(OnPolicyAlgorithm):
                 #     break
 
                 # update outer loss
-                value_loss, policy_loss, entropy_loss = self.outer_loss
                 print("="*10,"value_loss")
                 reverse_unroll(
-                    params_history[-1], self.shared_hypernet.parameters(), value_loss, set_grad=True)
-                print("="*10,"value_loss")
+                    params_history[-1], self.shared_hypernet.parameters(), self.value_loss, set_grad=True)
+                print("="*10,"policy_loss")
                 reverse_unroll(
-                    params_history[-1], self.shared_hypernet.parameters(), value_loss, set_grad=True)
-                print("="*10,"value_loss")
+                    params_history[-1], self.shared_hypernet.parameters(), self.policy_loss, set_grad=True)
+                print("="*10,"entropy_loss")
                 reverse_unroll(
-                    params_history[-1], self.shared_hypernet.parameters(), value_loss, set_grad=True)
+                    params_history[-1], self.shared_hypernet.parameters(), self.entropy_loss, set_grad=True)
                 import sys
                 sys.exit()
                 meta_opt.step()
