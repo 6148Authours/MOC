@@ -338,7 +338,7 @@ class PPO(OnPolicyAlgorithm):
         continue_training = True
 
         # Meta opt
-        meta_opt = th.optim.Adam(self.h_cell.parameters(), lr=1e-3)
+        meta_opt = th.optim.Adam(self.shared_hypernet.parameters(), lr=1e-3)
         meta_opt.zero_grad()
         self.train_time += 1
         params_history = []
